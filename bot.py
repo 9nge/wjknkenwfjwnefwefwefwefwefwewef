@@ -102,15 +102,18 @@ def is_supported_file(file_name: str) -> bool:
     return ext in SUPPORTED_EXTENSIONS
 
 
+# Ваш токен и URL для API CryptoBot
+CRYPTOBOT_API_TOKEN = os.getenv("CRYPTOBOT_API_TOKEN")
+CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
+
+# Замените старую donate_keyboard() на эту
 def donate_keyboard() -> InlineKeyboardMarkup:
+    # Ваша ссылка из t.me/send
+    cryptobot_link = "https://t.me/send?start=IVKdpMOgoHxI"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ 1", callback_data="donate:1")],
-            [InlineKeyboardButton(text="⭐ 5", callback_data="donate:5")],
-            [InlineKeyboardButton(text="⭐ 10", callback_data="donate:10")],
-            [InlineKeyboardButton(text="⭐ 50", callback_data="donate:50")],
-            [InlineKeyboardButton(text="⭐ 100", callback_data="donate:100")],
-            [InlineKeyboardButton(text="⭐ Ввести своё количество", callback_data="donate_custom")],
+            # Кнопка теперь ведёт прямо на ваш кошелёк в CryptoBot
+            [InlineKeyboardButton(text="⭐ Пожертвовать", url=cryptobot_link)],
         ]
     )
 
