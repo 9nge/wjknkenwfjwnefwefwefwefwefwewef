@@ -68,7 +68,7 @@ private void applyBypass(...) {
 @@/CODE@@
 Точка внедрения — в tick-метод игрока."""
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY, vertexai=True)
 MODEL_NAME = "gemini-3.1-flash-lite"
 
 bot = Bot(token=BOT_TOKEN)
