@@ -96,7 +96,7 @@ def donate_keyboard() -> InlineKeyboardMarkup:
     cryptobot_link = "https://t.me/send?start=IVKdpMOgoHxI"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ Пожертвовать", url=cryptobot_link)],
+            [InlineKeyboardButton(text="Пожертвовать", url=cryptobot_link)],
         ]
     )
 
@@ -226,7 +226,7 @@ def build_contents(chat_id: int, user_text: str) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "Привет! Просто напиши мне сообщение или отправь текстовый файл.\n\n"
-        "Поддержать меня можно звёздами:",
+        "Поддержать меня можно через cryptobot:",
         reply_markup=donate_keyboard(),
     )
 
