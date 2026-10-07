@@ -11,11 +11,8 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
-    CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    PreCheckoutQuery,
-    LabeledPrice,
 )
 from google import genai
 from google.genai import types
@@ -26,9 +23,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# === СИСТЕМНЫЙ ПРОМТ ===
-# Модель пишет чистым текстом, БЕЗ тегов и markdown.
-# Всё форматирование (эскейп + <pre> для кода) делает бот.
 SYSTEM_PROMPT = """Ты — NineAI, Telegram-бот. Отвечай ТОЛЬКО на русском языке, кратко, по делу, без воды.
 
 Правило имени:
@@ -75,7 +69,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 chat_histories: dict[int, list[dict]] = {}
-waiting_for_amount: set[int] = set()
 
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".json", ".xml", ".csv", ".html", ".htm",
@@ -90,10 +83,7 @@ SUPPORTED_EXTENSIONS = {
 
 MAX_FILE_CHARS = 50000
 HISTORY_LIMIT = 10
-TELEGRAM_LIMIT = 4000  # безопасный лимит, у Telegram 4096
 
-
-# === УТИЛИТЫ ===
 
 def is_supported_file(file_name: str) -> bool:
     if not file_name:
@@ -102,38 +92,15 @@ def is_supported_file(file_name: str) -> bool:
     return ext in SUPPORTED_EXTENSIONS
 
 
-# Ваш токен и URL для API CryptoBot
-CRYPTOBOT_API_TOKEN = os.getenv("CRYPTOBOT_API_TOKEN")
-CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
-
-# Замените старую donate_keyboard() на эту
 def donate_keyboard() -> InlineKeyboardMarkup:
-    # Ваша ссылка из t.me/send
     cryptobot_link = "https://t.me/send?start=IVKdpMOgoHxI"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            # Кнопка теперь ведёт прямо на ваш кошелёк в CryptoBot
             [InlineKeyboardButton(text="⭐ Пожертвовать", url=cryptobot_link)],
         ]
     )
 
 
-# Паттерн для поиска блоков кода в ответе модели.
-# Ловим три случая: ```...```, <pre>...</pre> и эвристику по отступам/скобкам.
-_CODE_BLOCK_RE = re.compile(
-    r"```(?:[a-zA-Z0-9_+-]*)\n?(.*?)```"
-    r"|<pre>(.*?)</pre>"
-    r"|<code>(.*?)</code>",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _escape(text: str) -> str:
-    """Эскейпит HTML-спецсимволы для parse_mode='HTML'."""
-    return html.escape(text, quote=False)
-
-
-# Маркеры кода, которые ставит модель
 _CODE_MARKER_RE = re.compile(r"@@CODE@@(.*?)@@/CODE@@", re.DOTALL)
 
 
@@ -142,16 +109,10 @@ def _escape(text: str) -> str:
 
 
 def format_for_telegram(text: str) -> str:
-    """
-    Превращает ответ модели в безопасный HTML для Telegram.
-    Код (между @@CODE@@ ... @@/CODE@@) → <blockquote>.
-    Всё остальное — эскейпится и идёт как обычный текст.
-    """
     if not text:
         return ""
-        
-    text = text.replace("```", "")
-    text = text.replace("`", "")
+
+    text = text.replace("```", "").replace("`", "")
 
     parts: list[str] = []
     last_end = 0
@@ -162,8 +123,6 @@ def format_for_telegram(text: str) -> str:
             parts.append(_escape(before.strip()))
 
         code = match.group(1).strip("\n")
-        # <blockquote> — серая вертикальная полоса, как цитата.
-        # expandable — сворачиваемая цитата (если слишком длинная).
         parts.append(f"<blockquote expandable>{_escape(code)}</blockquote>")
 
         last_end = match.end()
@@ -178,7 +137,6 @@ def format_for_telegram(text: str) -> str:
 
 
 def split_for_telegram(text: str, limit: int = 3800) -> list[str]:
-    """Режет длинный ответ по строкам, не ломая <blockquote>."""
     if len(text) <= limit:
         return [text]
 
@@ -193,10 +151,8 @@ def split_for_telegram(text: str, limit: int = 3800) -> list[str]:
         candidate = (current + "\n" + line) if current else line
 
         if len(candidate) > limit and current:
-            # Закрываем все незакрытые blockquote в текущей части
             current += "</blockquote>" * open_bq
             parts.append(current)
-            # Переоткрываем столько же в новой части
             current = ("<blockquote expandable>" * open_bq) + line
         else:
             current = candidate
@@ -211,11 +167,7 @@ def split_for_telegram(text: str, limit: int = 3800) -> list[str]:
 
 
 async def send_formatted(message: Message, raw_text: str) -> None:
-    """Отправляет ответ модели с правильным HTML-форматированием и разбивкой."""
-    formatted = format_for_telegram(raw_text)
-    if not formatted:
-        formatted = "…"
-        
+    formatted = format_for_telegram(raw_text) or "…"
 
     chunks = split_for_telegram(formatted)
     for chunk in chunks:
@@ -223,13 +175,11 @@ async def send_formatted(message: Message, raw_text: str) -> None:
             await message.answer(chunk, parse_mode=ParseMode.HTML)
         except Exception:
             logging.exception("Не удалось отправить HTML, шлём как plain text")
-            # Фолбэк: снимаем теги и шлём чистым текстом
             plain = re.sub(r"<[^>]+>", "", chunk)
             await message.answer(plain)
 
 
 async def call_gemini(contents: list, max_retries: int = 3) -> str:
-    """Единая точка вызова Gemini с retry на 429/503."""
     for attempt in range(max_retries):
         try:
             response = await asyncio.to_thread(
@@ -257,7 +207,6 @@ async def call_gemini(contents: list, max_retries: int = 3) -> str:
 
 
 def build_contents(chat_id: int, user_text: str) -> list:
-    """Добавляет сообщение в историю и собирает contents для Gemini."""
     history = chat_histories.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_text})
     trimmed = history[-HISTORY_LIMIT:]
@@ -273,8 +222,6 @@ def build_contents(chat_id: int, user_text: str) -> list:
     return contents
 
 
-# === ХЕНДЛЕРЫ ===
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
@@ -287,7 +234,7 @@ async def cmd_start(message: Message):
 @dp.message(Command("donate"))
 async def cmd_donate(message: Message):
     await message.answer(
-        "Выбери, сколько звёзд пожертвовать:",
+        "Поддержать проект:",
         reply_markup=donate_keyboard(),
     )
 
@@ -296,28 +243,6 @@ async def cmd_donate(message: Message):
 async def cmd_reset(message: Message):
     chat_histories.pop(message.chat.id, None)
     await message.answer("История диалога сброшена.")
-
-
-@dp.callback_query(F.data == "donate_custom")
-async def on_custom_donate(callback: CallbackQuery):
-    waiting_for_amount.add(callback.message.chat.id)
-    await callback.message.answer("Напиши, сколько звёзд ты хочешь пожертвовать (просто число):")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("donate:"))
-async def on_donate_click(callback: CallbackQuery):
-    stars = int(callback.data.split(":")[1])
-    await bot.send_invoice(
-        chat_id=callback.message.chat.id,
-        title="Пожертвование",
-        description=f"Поддержка на {stars} ⭐",
-        payload=f"donate_{stars}",
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(label="Пожертвование", amount=stars)],
-    )
-    await callback.answer()
 
 
 async def build_file_context(message: Message) -> str | None:
@@ -351,10 +276,6 @@ async def build_file_context(message: Message) -> str | None:
 async def handle_document(message: Message):
     chat_id = message.chat.id
 
-    if chat_id in waiting_for_amount:
-        await message.answer("Пожалуйста, введи число (сумму в звёздах).")
-        return
-
     file_context = await build_file_context(message)
 
     if file_context == "ERROR_UNSUPPORTED":
@@ -385,28 +306,6 @@ async def handle_message(message: Message):
     chat_id = message.chat.id
     user_text = message.text
 
-    if chat_id in waiting_for_amount:
-        try:
-            stars = int(user_text.strip())
-            if stars < 1:
-                await message.answer("Число должно быть больше 0.")
-                return
-        except ValueError:
-            await message.answer("Пожалуйста, введи целое число.")
-            return
-
-        waiting_for_amount.discard(chat_id)
-        await bot.send_invoice(
-            chat_id=chat_id,
-            title="Пожертвование",
-            description=f"Поддержка на {stars} ⭐",
-            payload=f"donate_{stars}",
-            provider_token="",
-            currency="XTR",
-            prices=[LabeledPrice(label="Пожертвование", amount=stars)],
-        )
-        return
-
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     contents = build_contents(chat_id, user_text)
@@ -414,26 +313,6 @@ async def handle_message(message: Message):
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     await send_formatted(message, answer)
-
-
-@dp.pre_checkout_query()
-async def on_pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-
-@dp.message(F.successful_payment)
-async def on_successful_payment(message: Message):
-    stars = message.successful_payment.total_amount
-    await message.answer(f"Спасибо за поддержку! Ты пожертвовал {stars} ⭐")
-
-    if OWNER_ID:
-        try:
-            await bot.send_message(
-                OWNER_ID,
-                f"Донат: {message.from_user.full_name} — {stars} ⭐",
-            )
-        except Exception:
-            logging.exception("Не удалось уведомить владельца")
 
 
 async def main():
