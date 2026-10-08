@@ -66,6 +66,7 @@ private void applyBypass(...) {
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-3.5-flash-lite"
 
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 chat_histories: dict[int, list[dict]] = {}
@@ -353,7 +354,7 @@ async def build_file_context(message: Message) -> str | None:
         return "ERROR_UNSUPPORTED"
 
     try:
-        file_bytes: io.BytesIO = await message.bot.download(doc)
+        file_bytes: io.BytesIO = await bot.download(doc)
         if file_bytes is None:
             return "ERROR_DOWNLOAD"
 
@@ -389,7 +390,7 @@ async def handle_document(message: Message):
     else:
         combined = user_text or "(файл без текста)"
 
-    await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+    await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     contents = build_contents(chat_id, combined)
     answer = await call_gemini(contents, chat_id)
@@ -403,7 +404,7 @@ async def handle_message(message: Message):
     chat_id = message.chat.id
     user_text = message.text
 
-    await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+    await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     contents = build_contents(chat_id, user_text)
     answer = await call_gemini(contents, chat_id)
@@ -417,9 +418,7 @@ async def main():
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
-    # Токен бота и объект Bot теперь не создаются здесь.
-    # Точка входа polling должна быть вынесена отдельно.
-    raise RuntimeError("Bot polling отключён: убери этот вызов или передай Bot извне.")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
