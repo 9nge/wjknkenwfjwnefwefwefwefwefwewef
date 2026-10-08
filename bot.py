@@ -4,6 +4,9 @@ import logging
 import io
 import html
 import re
+import json
+import hmac
+import hashlib
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -20,6 +23,8 @@ from aiogram.types import (
 )
 from google import genai
 from google.genai import types
+from aiohttp import web
+from aiocryptopay import AioCryptoPay, Networks
 
 try:
     from dotenv import load_dotenv
@@ -31,6 +36,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
+CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN", "")
+CRYPTOBOT_NETWORK = os.getenv("CRYPTOBOT_NETWORK", "main")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не задан. Добавь его в Environment variables хостинга "
@@ -40,6 +50,10 @@ if not GEMINI_API_KEY:
     raise RuntimeError(
         "GEMINI_API_KEY не задан. Добавь его в Environment variables хостинга "
         "(или в .env при локальном запуске)."
+    )
+if not CRYPTOBOT_TOKEN:
+    raise RuntimeError(
+        "CRYPTOBOT_TOKEN не задан. Получи его в @CryptoBot -> Crypto Pay -> Create App."
     )
 
 SYSTEM_PROMPT = """Ты — NineAI, Telegram-бот. Отвечай ТОЛЬКО на русском языке, кратко, по делу, без воды.
@@ -83,12 +97,12 @@ private void applyBypass(...) {
 @@/CODE@@
 Точка внедрения — в tick-метод игрока."""
 
-SUBSCRIBE_URL = "https://t.me/send?start=IVKdpMOgoHxI"
+SUBSCRIBE_PRICE = 1  # USDT
 
 MODELS = {
     "nine_code": {
         "name": "Nine Code",
-        "real": "gemini-3.8-flash",          # Обновлено
+        "real": "gemini-3.8-flash",
         "free_limit": 5,
         "paid_limit": 50,
     },
@@ -100,7 +114,7 @@ MODELS = {
     },
     "nine_flash": {
         "name": "Nine Flash",
-        "real": "gemini-3.1-flash-lite",     # Обновлено
+        "real": "gemini-3.1-flash-lite",
         "free_limit": None,
         "paid_limit": None,
     },
@@ -111,6 +125,9 @@ MODEL_ORDER = ["nine_code", "nine_pro", "nine_flash"]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 logging.info("Клиент GenAI инициализирован в режиме Gemini Developer API (AI Studio).")
+
+CRYPTO_NETWORK = Networks.MAIN_NET if CRYPTOBOT_NETWORK == "main" else Networks.TEST_NET
+crypto = AioCryptoPay(token=CRYPTOBOT_TOKEN, network=CRYPTO_NETWORK)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -233,7 +250,10 @@ def chats_inline(state: UserState) -> InlineKeyboardMarkup:
 
 def subscribe_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оформить подписку за 1 USDT", url=SUBSCRIBE_URL)],
+        [InlineKeyboardButton(
+            text=f"Оформить подписку за {SUBSCRIBE_PRICE} USDT",
+            callback_data="pay_subscribe",
+        )],
     ])
 
 
@@ -420,22 +440,17 @@ async def call_gemini(contents: list, chat_id: int, model_key: str, max_retries:
             err = str(e)
             last_err = err
 
-            # === ИЗМЕНЕНИЕ: Различаем типы ошибок ===
-            # 403 — проблема с ключом
             if "403" in err or "PERMISSION_DENIED" in err:
                 logging.error(f"Ошибка доступа (403) для модели {display_name}: {err[:200]}")
                 return f"Сервис временно недоступен (проблема с доступом к API). Сообщи администратору."
 
-            # 404 — модель не найдена
             if "404" in err or "NOT_FOUND" in err:
                 logging.error(f"Модель {real_model} не найдена: {err[:200]}")
                 return f"Модель {display_name} сейчас недоступна. Сообщи администратору."
 
-            # 429 — лимит запросов
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
                 return f"Закончился лимит на использование модели {display_name}. Попробуй позже."
 
-            # 503 — временная ошибка, пробуем еще раз
             transient = ("503" in err) or ("UNAVAILABLE" in err)
             if transient and attempt < max_retries - 1:
                 wait = (2 ** attempt) + 1
@@ -443,11 +458,9 @@ async def call_gemini(contents: list, chat_id: int, model_key: str, max_retries:
                 await asyncio.sleep(wait)
                 continue
 
-            # Все остальные ошибки
             logging.exception(f"Неизвестная ошибка Gemini для модели {display_name}")
             return f"Произошла ошибка при обращении к модели {display_name}. Попробуй позже."
 
-    # Если все попытки исчерпаны
     return f"Модель {display_name} временно недоступна. Попробуй через несколько секунд."
 
 
@@ -493,7 +506,10 @@ def start_keyboard() -> InlineKeyboardMarkup:
                 text="Обучить модель на майнкрафт читах",
                 callback_data="train",
             )],
-            [InlineKeyboardButton(text="Оформить подписку за 1 USDT", url=SUBSCRIBE_URL)],
+            [InlineKeyboardButton(
+                text=f"Оформить подписку за {SUBSCRIBE_PRICE} USDT",
+                callback_data="pay_subscribe",
+            )],
         ]
     )
 
@@ -618,6 +634,41 @@ async def on_train(callback: CallbackQuery):
         f"Готово. Загружено файлов: {file_count}.\n"
         f"Объём базы: {len(data)} символов.\n\n"
         "Теперь можем приступить к работе — я буду опираться на чужие читы."
+    )
+
+
+@dp.callback_query(F.data == "pay_subscribe")
+async def on_pay_subscribe(callback: CallbackQuery):
+    uid = callback.from_user.id
+    await callback.answer("Создаю счёт...")
+
+    try:
+        invoice = await crypto.create_invoice(
+            asset="USDT",
+            amount=SUBSCRIBE_PRICE,
+            description=f"Подписка NineAI — user {uid}",
+            payload=str(uid),
+            expires_in=3600,
+        )
+    except Exception:
+        logging.exception("Не удалось создать счёт CryptoBot")
+        await callback.message.answer(
+            "Не удалось создать счёт. Попробуй позже или сообщи администратору."
+        )
+        return
+
+    pay_url = getattr(invoice, "bot_invoice_url", None) or getattr(invoice, "mini_app_invoice_url", None)
+    if not pay_url:
+        await callback.message.answer("CryptoBot не вернул ссылку на оплату. Попробуй позже.")
+        return
+
+    await callback.message.answer(
+        f"Счёт на {SUBSCRIBE_PRICE} USDT создан.\n"
+        "Оплати по кнопке ниже — подписка активируется автоматически в течение минуты.\n\n"
+        "Если оплата не пришла, напиши администратору.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Оплатить в CryptoBot", url=pay_url)],
+        ]),
     )
 
 
@@ -754,7 +805,7 @@ async def handle_user_request(message: Message, user_text: str) -> None:
             f"Исчерпан дневной лимит запросов для модели {display_name}.\n\n"
             f"Бесплатно: {used}/{limit} запросов в день.\n"
             f"С подпиской: до {MODELS[model_key]['paid_limit']} запросов в день.\n\n"
-            "Оформить подписку за 1 USDT:",
+            f"Оформить подписку за {SUBSCRIBE_PRICE} USDT:",
             reply_markup=subscribe_inline(),
         )
         return
@@ -811,11 +862,98 @@ async def handle_message(message: Message):
     await handle_user_request(message, message.text)
 
 
+# === Вебхук CryptoBot ===
+
+def verify_crypto_signature(raw_body: bytes, signature: str) -> bool:
+    secret = hashlib.sha256(CRYPTOBOT_TOKEN.encode()).digest()
+    expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def crypto_webhook(request: web.Request) -> web.Response:
+    raw = await request.read()
+    signature = request.headers.get("crypto-pay-api-signature", "")
+
+    if not verify_crypto_signature(raw, signature):
+        logging.warning("Вебхук CryptoBot: неверная подпись, отклонено.")
+        return web.Response(status=403)
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logging.exception("Вебхук CryptoBot: не удалось распарсить JSON")
+        return web.Response(status=400)
+
+    update_type = data.get("update_type")
+    if update_type == "invoice_paid":
+        invoice = data.get("payload", {})
+        payload = invoice.get("payload", "")
+        try:
+            uid = int(payload)
+        except (TypeError, ValueError):
+            uid = 0
+
+        if uid:
+            st = get_user_state(uid)
+            st.subscribed = True
+            logging.info(
+                f"Подписка активирована для {uid} "
+                f"(invoice_id={invoice.get('invoice_id')}, "
+                f"amount={invoice.get('amount')} {invoice.get('asset')})"
+            )
+
+            try:
+                await bot.send_message(
+                    uid,
+                    "Подписка активирована. Дневные лимиты сняты.\n\n"
+                    "• Nine Code — до 50 запросов в день\n"
+                    "• Nine Pro — до 90 запросов в день\n"
+                    "• Nine Flash — без лимита",
+                    reply_markup=main_menu(),
+                )
+            except Exception:
+                logging.exception("Не удалось отправить уведомление о подписке")
+
+    return web.Response(text="ok")
+
+
+async def run_webhook_server():
+    app = web.Application()
+    app.router.add_post("/webhook/crypto", crypto_webhook)
+    app.router.add_get("/webhook/crypto", lambda r: web.Response(text="crypto webhook alive"))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    await site.start()
+    logging.info(f"Вебхук-сервер CryptoBot запущен на порту {WEBHOOK_PORT}")
+
+    return runner
+
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
+
+    await run_webhook_server()
+
+    if WEBHOOK_URL:
+        try:
+            await crypto.set_webhook(WEBHOOK_URL)
+            logging.info(f"Вебхук CryptoBot зарегистрирован: {WEBHOOK_URL}")
+        except Exception:
+            logging.exception(
+                "Не удалось зарегистрировать вебхук CryptoBot. "
+                "Проверь WEBHOOK_URL (должен быть публичный HTTPS) и токен."
+            )
+    else:
+        logging.warning(
+            "WEBHOOK_URL не задан. Оплата будет создаваться, но подписка "
+            "не будет активироваться автоматически. Используй /activate <user_id>."
+        )
+
     await dp.start_polling(bot)
 
 
