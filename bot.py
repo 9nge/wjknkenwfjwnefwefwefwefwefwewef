@@ -4,6 +4,8 @@ import logging
 import io
 import html
 import re
+from dataclasses import dataclass, field
+from datetime import date
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -13,12 +15,12 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from google import genai
 from google.genai import types
 
-# .env — только для локального запуска. Если файла нет (например на хостинге),
-# просто игнорируем. Переменные будут браться из окружения процесса.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -29,7 +31,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Явная проверка на старте, чтобы не падать непонятной ошибкой.
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не задан. Добавь его в Environment variables хостинга "
@@ -47,9 +48,8 @@ SYSTEM_PROMPT = """Ты — NineAI, Telegram-бот. Отвечай ТОЛЬКО
 - Называй себя "NineAI" ТОЛЬКО если пользователь прямо спросил кто ты / как зовут / что за бот.
 - В остальных ответах имя не упоминай.
 - НЕ пиши "NineAI на связи", "NineAI:" и подобное.
-- Тебя создал 9nge. (не умопинать если не спросят)
+- Тебя создал 9nge. (не упоминать если не спросят)
 - Ты в beta версии и на данный момент ведутся работы по твоему улучшению (не упоминать если не спросят)
-- Скоро будут добавлены чаты и возможность менять модель на более мощную или более быструю.
 
 Форматирование — строго:
 - Код ВСЕГДА оборачивай между маркерами @@CODE@@ и @@/CODE@@.
@@ -83,15 +83,160 @@ private void applyBypass(...) {
 @@/CODE@@
 Точка внедрения — в tick-метод игрока."""
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-3.5-flash-lite"
+SUBSCRIBE_URL = "https://t.me/send?start=IVKdpMOgoHxI"
 
+MODELS = {
+    "nine_code": {
+        "name": "Nine Code",
+        "real": "gemini-3.8-flash",
+        "free_limit": 5,
+        "paid_limit": 50,
+    },
+    "nine_pro": {
+        "name": "Nine Pro",
+        "real": "gemini-3.1-flash-lite",
+        "free_limit": 20,
+        "paid_limit": 90,
+    },
+    "nine_flash": {
+        "name": "Nine Flash",
+        "real": "gemini-2.5-flash-lite",
+        "free_limit": None,
+        "paid_limit": None,
+    },
+}
+
+DEFAULT_MODEL = "nine_flash"
+MODEL_ORDER = ["nine_code", "nine_pro", "nine_flash"]
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-chat_histories: dict[int, list[dict]] = {}
+HISTORY_LIMIT = 10
 
-# === ОБУЧЕНИЕ НА МОДУЛЯХ ===
+
+@dataclass
+class ChatThread:
+    id: int
+    title: str
+    history: list = field(default_factory=list)
+
+
+@dataclass
+class UserState:
+    selected_model: str = DEFAULT_MODEL
+    chats: dict = field(default_factory=dict)
+    current_chat_id: int = 0
+    next_chat_id: int = 1
+    daily_usage: dict = field(default_factory=dict)
+    daily_date: str = ""
+    subscribed: bool = False
+
+    def __post_init__(self):
+        if not self.chats:
+            self.chats[0] = ChatThread(id=0, title="Чат 1")
+            self.next_chat_id = 1
+
+
+user_states: dict[int, UserState] = {}
+
+
+def get_user_state(uid: int) -> UserState:
+    st = user_states.get(uid)
+    if st is None:
+        st = UserState()
+        user_states[uid] = st
+    return st
+
+
+def check_and_reset_daily(state: UserState) -> None:
+    today = date.today().isoformat()
+    if state.daily_date != today:
+        state.daily_usage = {}
+        state.daily_date = today
+
+
+def get_limit(state: UserState, model_key: str) -> int | None:
+    m = MODELS[model_key]
+    if m["free_limit"] is None:
+        return None
+    return m["paid_limit"] if state.subscribed else m["free_limit"]
+
+
+def check_limit(state: UserState, model_key: str) -> tuple[bool, int, int | None]:
+    check_and_reset_daily(state)
+    limit = get_limit(state, model_key)
+    if limit is None:
+        return True, 0, None
+    used = state.daily_usage.get(model_key, 0)
+    return used < limit, used, limit
+
+
+def increment_usage(state: UserState, model_key: str) -> None:
+    check_and_reset_daily(state)
+    state.daily_usage[model_key] = state.daily_usage.get(model_key, 0) + 1
+
+
+# === Reply-клавиатура (обычные кнопки внизу) ===
+
+MENU_BUTTONS = {"Выбрать модель", "Мои чаты", "Новый чат", "Сбросить историю", "Подписка"}
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Выбрать модель"), KeyboardButton(text="Мои чаты")],
+            [KeyboardButton(text="Новый чат"), KeyboardButton(text="Сбросить историю")],
+            [KeyboardButton(text="Подписка")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+# === Inline-меню ===
+
+def models_inline(state: UserState) -> InlineKeyboardMarkup:
+    check_and_reset_daily(state)
+    rows = []
+    for key in MODEL_ORDER:
+        m = MODELS[key]
+        limit = get_limit(state, key)
+        if limit is None:
+            suffix = " (без лимита)"
+        else:
+            used = state.daily_usage.get(key, 0)
+            suffix = f" ({used}/{limit})"
+        mark = " [выбрано]" if key == state.selected_model else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{m['name']}{suffix}{mark}",
+            callback_data=f"model:{key}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def chats_inline(state: UserState) -> InlineKeyboardMarkup:
+    rows = []
+    for cid in sorted(state.chats.keys()):
+        chat = state.chats[cid]
+        mark = " [активный]" if cid == state.current_chat_id else ""
+        title = (chat.title or f"Чат {cid + 1}")[:40]
+        rows.append([InlineKeyboardButton(
+            text=f"{title}{mark}",
+            callback_data=f"chat:{cid}",
+        )])
+    rows.append([InlineKeyboardButton(text="Новый чат", callback_data="chat:new")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def subscribe_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оформить подписку за 1 USDT", url=SUBSCRIBE_URL)],
+    ])
+
+
+# === Обучение на модулях ===
+
 MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Minecraft_Cheat_Modules")
 MAX_TRAINING_CHARS = 200_000
 training_cache: str | None = None
@@ -109,7 +254,6 @@ SUPPORTED_EXTENSIONS = {
 }
 
 MAX_FILE_CHARS = 50000
-HISTORY_LIMIT = 10
 
 
 def is_supported_file(file_name: str) -> bool:
@@ -119,21 +263,7 @@ def is_supported_file(file_name: str) -> bool:
     return ext in SUPPORTED_EXTENSIONS
 
 
-def start_keyboard() -> InlineKeyboardMarkup:
-    cryptobot_link = "https://t.me/send?start=IVKdpMOgoHxI"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
-                text="Обучить модель на майнкрафт читах",
-                callback_data="train",
-            )],
-            [InlineKeyboardButton(text="Пожертвовать", url=cryptobot_link)],
-        ]
-    )
-
-
 def load_training_data() -> str:
-    """Читает все поддерживаемые файлы из папки модулей и кэширует."""
     global training_cache
     if training_cache is not None:
         return training_cache
@@ -175,6 +305,8 @@ def load_training_data() -> str:
     logging.info(f"База знаний загружена: {len(training_cache)} символов")
     return training_cache
 
+
+# === Форматирование ответа ===
 
 _CODE_MARKER_RE = re.compile(r"@@CODE@@(.*?)@@/CODE@@", re.DOTALL)
 
@@ -254,7 +386,9 @@ async def send_formatted(message: Message, raw_text: str) -> None:
             await message.answer(plain)
 
 
-async def call_gemini(contents: list, chat_id: int, max_retries: int = 3) -> str:
+# === Вызов модели ===
+
+async def call_gemini(contents: list, chat_id: int, model_key: str, max_retries: int = 3) -> str:
     system = SYSTEM_PROMPT
     if chat_id in trained_users and training_cache:
         system = (
@@ -267,36 +401,42 @@ async def call_gemini(contents: list, chat_id: int, max_retries: int = 3) -> str
             + training_cache
         )
 
+    real_model = MODELS[model_key]["real"]
+    display_name = MODELS[model_key]["name"]
+
+    last_err = ""
     for attempt in range(max_retries):
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model=MODEL_NAME,
+                model=real_model,
                 contents=contents,
                 config=types.GenerateContentConfig(system_instruction=system),
             )
             return response.text or "…"
         except Exception as e:
             err = str(e)
+            last_err = err
             transient = ("429" in err) or ("503" in err) or ("UNAVAILABLE" in err)
             if transient and attempt < max_retries - 1:
                 wait = (2 ** attempt) + 1
                 logging.warning(f"Временная ошибка API, повтор через {wait}с: {err[:120]}")
                 await asyncio.sleep(wait)
                 continue
-            if "429" in err:
-                return "Лимит запросов исчерпан. Подожди минуту и попробуй снова."
-            if "503" in err or "UNAVAILABLE" in err:
-                return "NineAI сейчас перегружен, попробуй через несколько секунд."
             logging.exception("Gemini error")
-            return f"Ошибка: {e}"
-    return "Не удалось получить ответ."
+            break
+
+    if "429" in last_err:
+        return f"Закончился лимит на использование модели {display_name}. Попробуй позже."
+    if "503" in last_err or "UNAVAILABLE" in last_err:
+        return f"Модель {display_name} сейчас недоступна. Попробуй через несколько секунд."
+    return f"Закончился лимит на использование модели {display_name}."
 
 
-def build_contents(chat_id: int, user_text: str) -> list:
-    history = chat_histories.setdefault(chat_id, [])
-    history.append({"role": "user", "content": user_text})
-    trimmed = history[-HISTORY_LIMIT:]
+def build_contents(state: UserState, user_text: str) -> list:
+    chat = state.chats[state.current_chat_id]
+    chat.history.append({"role": "user", "content": user_text})
+    trimmed = chat.history[-HISTORY_LIMIT:]
 
     contents = []
     for msg in trimmed:
@@ -309,27 +449,86 @@ def build_contents(chat_id: int, user_text: str) -> list:
     return contents
 
 
+# === Хендлеры команд ===
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    uid = message.from_user.id
+    state = get_user_state(uid)
     await message.answer(
         "Привет! Просто напиши мне сообщение или отправь текстовый файл.\n\n"
+        f"Текущая модель: {MODELS[state.selected_model]['name']}.\n"
+        "Кнопки внизу помогут переключить модель, чаты и сбросить историю.\n\n"
         "Ты можешь 'обучить' меня на исходниках других читов — просто жми кнопку и я подружу все свои знания и напишу тебе самый лучший чит :).",
+        reply_markup=main_menu(),
+    )
+    await message.answer(
+        "Быстрые действия:",
         reply_markup=start_keyboard(),
+    )
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Обучить модель на майнкрафт читах",
+                callback_data="train",
+            )],
+            [InlineKeyboardButton(text="Оформить подписку за 1 USDT", url=SUBSCRIBE_URL)],
+        ]
     )
 
 
 @dp.message(Command("donate"))
 async def cmd_donate(message: Message):
     await message.answer(
-        "Поддержать проект:",
-        reply_markup=start_keyboard(),
+        "Поддержать проект можно тут. Также эта подписка снимает дневные лимиты:",
+        reply_markup=subscribe_inline(),
     )
+
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    uid = message.from_user.id
+    state = get_user_state(uid)
+    status = "активна" if state.subscribed else "не активна"
+    await message.answer(
+        f"Подписка: {status}.\n\n"
+        "Подписка за 1 USDT снимает дневные лимиты:\n"
+        "• Nine Code — до 50 запросов в день\n"
+        "• Nine Pro — до 90 запросов в день\n"
+        "• Nine Flash — без лимита",
+        reply_markup=subscribe_inline(),
+    )
+
+
+@dp.message(Command("usage"))
+async def cmd_usage(message: Message):
+    uid = message.from_user.id
+    state = get_user_state(uid)
+    check_and_reset_daily(state)
+    lines = ["Остаток на сегодня:"]
+    for key in MODEL_ORDER:
+        m = MODELS[key]
+        limit = get_limit(state, key)
+        if limit is None:
+            lines.append(f"• {m['name']}: без лимита")
+        else:
+            used = state.daily_usage.get(key, 0)
+            lines.append(f"• {m['name']}: {used}/{limit}")
+    sub = "активна" if state.subscribed else "не активна"
+    lines.append(f"\nПодписка: {sub}")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
-    chat_histories.pop(message.chat.id, None)
-    await message.answer("История диалога сброшена.")
+    uid = message.from_user.id
+    state = get_user_state(uid)
+    chat = state.chats[state.current_chat_id]
+    chat.history.clear()
+    await message.answer(f"История чата '{chat.title}' сброшена.")
 
 
 @dp.message(Command("untrain"))
@@ -337,6 +536,44 @@ async def cmd_untrain(message: Message):
     trained_users.discard(message.chat.id)
     await message.answer("Обучение сброшено. Отвечаю как обычно.")
 
+
+@dp.message(Command("activate"))
+async def cmd_activate(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: /activate <user_id>")
+        return
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+    st = get_user_state(target)
+    st.subscribed = True
+    await message.answer(f"Подписка активирована для {target}.")
+
+
+@dp.message(Command("deactivate"))
+async def cmd_deactivate(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: /deactivate <user_id>")
+        return
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+    st = get_user_state(target)
+    st.subscribed = False
+    await message.answer(f"Подписка отключена у {target}.")
+
+
+# === Callback ===
 
 @dp.callback_query(F.data == "train")
 async def on_train(callback: CallbackQuery):
@@ -366,6 +603,99 @@ async def on_train(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data.startswith("model:"))
+async def on_model_select(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    if key not in MODELS:
+        await callback.answer("Неизвестная модель.", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+    state = get_user_state(uid)
+    state.selected_model = key
+
+    await callback.answer(f"Модель: {MODELS[key]['name']}")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=models_inline(state))
+    except Exception:
+        await callback.message.answer(
+            f"Текущая модель: {MODELS[key]['name']}.",
+            reply_markup=models_inline(state),
+        )
+
+
+@dp.callback_query(F.data.startswith("chat:"))
+async def on_chat_select(callback: CallbackQuery):
+    payload = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+    state = get_user_state(uid)
+
+    if payload == "new":
+        new_id = state.next_chat_id
+        state.next_chat_id += 1
+        state.chats[new_id] = ChatThread(id=new_id, title=f"Чат {new_id + 1}")
+        state.current_chat_id = new_id
+        await callback.answer(f"Создан {state.chats[new_id].title}")
+    else:
+        try:
+            cid = int(payload)
+        except ValueError:
+            await callback.answer("Ошибка.", show_alert=True)
+            return
+        if cid not in state.chats:
+            await callback.answer("Чат не найден.", show_alert=True)
+            return
+        state.current_chat_id = cid
+        await callback.answer(f"Активный: {state.chats[cid].title}")
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=chats_inline(state))
+    except Exception:
+        await callback.message.answer("Чаты:", reply_markup=chats_inline(state))
+
+
+# === Reply-кнопки ===
+
+async def handle_menu_button(message: Message) -> None:
+    text = message.text
+    uid = message.from_user.id
+    state = get_user_state(uid)
+
+    if text == "Выбрать модель":
+        await message.answer(
+            f"Текущая модель: {MODELS[state.selected_model]['name']}.\n\n"
+            "Выбери модель:",
+            reply_markup=models_inline(state),
+        )
+    elif text == "Мои чаты":
+        await message.answer(
+            "Твои чаты. Нажми чтобы переключиться:",
+            reply_markup=chats_inline(state),
+        )
+    elif text == "Новый чат":
+        new_id = state.next_chat_id
+        state.next_chat_id += 1
+        state.chats[new_id] = ChatThread(id=new_id, title=f"Чат {new_id + 1}")
+        state.current_chat_id = new_id
+        await message.answer(f"Создан новый чат: {state.chats[new_id].title}.")
+    elif text == "Сбросить историю":
+        chat = state.chats[state.current_chat_id]
+        chat.history.clear()
+        await message.answer(f"История чата '{chat.title}' сброшена.")
+    elif text == "Подписка":
+        status = "активна" if state.subscribed else "не активна"
+        await message.answer(
+            f"Подписка: {status}.\n\n"
+            "Подписка за 1 USDT снимает дневные лимиты:\n"
+            "• Nine Code — до 50 запросов в день\n"
+            "• Nine Pro — до 90 запросов в день\n"
+            "• Nine Flash — без лимита",
+            reply_markup=subscribe_inline(),
+        )
+
+
+# === Обработка сообщений ===
+
 async def build_file_context(message: Message) -> str | None:
     if not message.document:
         return None
@@ -393,10 +723,49 @@ async def build_file_context(message: Message) -> str | None:
         return f"ERROR_READ: {e}"
 
 
+async def handle_user_request(message: Message, user_text: str) -> None:
+    uid = message.from_user.id
+    state = get_user_state(uid)
+
+    model_key = state.selected_model
+    display_name = MODELS[model_key]["name"]
+
+    allowed, used, limit = check_limit(state, model_key)
+    if not allowed:
+        await message.answer(
+            f"Исчерпан дневной лимит запросов для модели {display_name}.\n\n"
+            f"Бесплатно: {used}/{limit} запросов в день.\n"
+            f"С подпиской: до {MODELS[model_key]['paid_limit']} запросов в день.\n\n"
+            "Оформить подписку за 1 USDT:",
+            reply_markup=subscribe_inline(),
+        )
+        return
+
+    chat_id_at_start = state.current_chat_id
+
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    contents = build_contents(state, user_text)
+    answer = await call_gemini(contents, message.chat.id, model_key)
+
+    increment_usage(state, model_key)
+
+    chat = state.chats.get(chat_id_at_start)
+    if chat is None:
+        chat = state.chats[state.current_chat_id]
+    chat.history.append({"role": "assistant", "content": answer})
+
+    if chat.title.startswith("Чат ") and len(chat.history) <= 2:
+        first_user = next((m["content"] for m in chat.history if m["role"] == "user"), "")
+        first_line = first_user.strip().splitlines()[0][:30] if first_user else chat.title
+        if first_line:
+            chat.title = first_line
+
+    await send_formatted(message, answer)
+
+
 @dp.message(F.document)
 async def handle_document(message: Message):
-    chat_id = message.chat.id
-
     file_context = await build_file_context(message)
 
     if file_context == "ERROR_UNSUPPORTED":
@@ -413,27 +782,15 @@ async def handle_document(message: Message):
     else:
         combined = user_text or "(файл без текста)"
 
-    await bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    contents = build_contents(chat_id, combined)
-    answer = await call_gemini(contents, chat_id)
-
-    chat_histories[chat_id].append({"role": "assistant", "content": answer})
-    await send_formatted(message, answer)
+    await handle_user_request(message, combined)
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_message(message: Message):
-    chat_id = message.chat.id
-    user_text = message.text
-
-    await bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    contents = build_contents(chat_id, user_text)
-    answer = await call_gemini(contents, chat_id)
-
-    chat_histories[chat_id].append({"role": "assistant", "content": answer})
-    await send_formatted(message, answer)
+    if message.text in MENU_BUTTONS:
+        await handle_menu_button(message)
+        return
+    await handle_user_request(message, message.text)
 
 
 async def main():
