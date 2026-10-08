@@ -11,6 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
+    CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
@@ -70,6 +71,12 @@ dp = Dispatcher()
 
 chat_histories: dict[int, list[dict]] = {}
 
+# === ОБУЧЕНИЕ НА МОДУЛЯХ ===
+MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Minecraft_Cheat_Modules")
+MAX_TRAINING_CHARS = 200_000
+training_cache: str | None = None
+trained_users: set[int] = set()
+
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".json", ".xml", ".csv", ".html", ".htm",
     ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".hpp",
@@ -92,13 +99,61 @@ def is_supported_file(file_name: str) -> bool:
     return ext in SUPPORTED_EXTENSIONS
 
 
-def donate_keyboard() -> InlineKeyboardMarkup:
+def start_keyboard() -> InlineKeyboardMarkup:
     cryptobot_link = "https://t.me/send?start=IVKdpMOgoHxI"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🎓 Обучить модель на майнкрафт читах",
+                callback_data="train",
+            )],
             [InlineKeyboardButton(text="Пожертвовать", url=cryptobot_link)],
         ]
     )
+
+
+def load_training_data() -> str:
+    """Читает все поддерживаемые файлы из Minecraft_Cheat_Modules и кэширует."""
+    global training_cache
+    if training_cache is not None:
+        return training_cache
+
+    if not os.path.isdir(MODULES_DIR):
+        training_cache = ""
+        return ""
+
+    parts: list[str] = []
+    total = 0
+
+    for root, _, files in os.walk(MODULES_DIR):
+        for fname in sorted(files):
+            ext = os.path.splitext(fname.lower())[1]
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+
+            path = os.path.join(root, fname)
+            rel = os.path.relpath(path, MODULES_DIR)
+
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                logging.exception(f"Не удалось прочитать {rel}")
+                continue
+
+            header = f"\n\n===== FILE: {rel} =====\n"
+            chunk = header + content
+
+            if total + len(chunk) > MAX_TRAINING_CHARS:
+                parts.append(f"\n\n===== FILE: {rel} ===== (пропущен, превышен лимит)")
+                continue
+
+            parts.append(chunk)
+            total += len(chunk)
+
+    training_cache = "".join(parts)
+    logging.info(f"База знаний загружена: {len(training_cache)} символов")
+    return training_cache
 
 
 _CODE_MARKER_RE = re.compile(r"@@CODE@@(.*?)@@/CODE@@", re.DOTALL)
@@ -179,14 +234,23 @@ async def send_formatted(message: Message, raw_text: str) -> None:
             await message.answer(plain)
 
 
-async def call_gemini(contents: list, max_retries: int = 3) -> str:
+async def call_gemini(contents: list, chat_id: int, max_retries: int = 3) -> str:
+    system = SYSTEM_PROMPT
+    if chat_id in trained_users and training_cache:
+        system = (
+            SYSTEM_PROMPT
+            + "\n\n=== БАЗА ЗНАНИЙ: модули читов и обходы ===\n"
+            + "Используй эти материалы как основу для ответов про обходы античитов.\n"
+            + training_cache
+        )
+
     for attempt in range(max_retries):
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=MODEL_NAME,
                 contents=contents,
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                config=types.GenerateContentConfig(system_instruction=system),
             )
             return response.text or "…"
         except Exception as e:
@@ -226,8 +290,8 @@ def build_contents(chat_id: int, user_text: str) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "Привет! Просто напиши мне сообщение или отправь текстовый файл.\n\n"
-        "Поддержать меня можно через cryptobot:",
-        reply_markup=donate_keyboard(),
+        "Можешь обучить меня на своих модулях читов — жми кнопку ниже.",
+        reply_markup=start_keyboard(),
     )
 
 
@@ -235,7 +299,7 @@ async def cmd_start(message: Message):
 async def cmd_donate(message: Message):
     await message.answer(
         "Поддержать проект:",
-        reply_markup=donate_keyboard(),
+        reply_markup=start_keyboard(),
     )
 
 
@@ -243,6 +307,40 @@ async def cmd_donate(message: Message):
 async def cmd_reset(message: Message):
     chat_histories.pop(message.chat.id, None)
     await message.answer("История диалога сброшена.")
+
+
+@dp.message(Command("untrain"))
+async def cmd_untrain(message: Message):
+    trained_users.discard(message.chat.id)
+    await message.answer("Обучение сброшено. Отвечаю как обычно.")
+
+
+@dp.callback_query(F.data == "train")
+async def on_train(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+
+    if chat_id in trained_users:
+        await callback.answer("Уже обучен.", show_alert=True)
+        return
+
+    await callback.answer("Загружаю модули...")
+
+    data = load_training_data()
+    if not data:
+        await callback.message.answer(
+            "Папка Minecraft_Cheat_Modules пуста или не найдена.\n"
+            "Создай её в корне проекта и положи туда файлы."
+        )
+        return
+
+    trained_users.add(chat_id)
+
+    file_count = data.count("===== FILE:")
+    await callback.message.answer(
+        f"Готово. Загружено файлов: {file_count}.\n"
+        f"Объём базы: {len(data)} символов.\n\n"
+        "Теперь можешь спрашивать про обходы — я буду опираться на твои модули."
+    )
 
 
 async def build_file_context(message: Message) -> str | None:
@@ -295,7 +393,7 @@ async def handle_document(message: Message):
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     contents = build_contents(chat_id, combined)
-    answer = await call_gemini(contents)
+    answer = await call_gemini(contents, chat_id)
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     await send_formatted(message, answer)
@@ -309,7 +407,7 @@ async def handle_message(message: Message):
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     contents = build_contents(chat_id, user_text)
-    answer = await call_gemini(contents)
+    answer = await call_gemini(contents, chat_id)
 
     chat_histories[chat_id].append({"role": "assistant", "content": answer})
     await send_formatted(message, answer)
