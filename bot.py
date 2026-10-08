@@ -111,7 +111,7 @@ def start_keyboard() -> InlineKeyboardMarkup:
 
 
 def load_training_data() -> str:
-    """Читает все поддерживаемые файлы из Minecraft_Cheat_Modules и кэширует."""
+    """Читает все поддерживаемые файлы с сайта yougame.biz и кэширует."""
     global training_cache
     if training_cache is not None:
         return training_cache
