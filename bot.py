@@ -88,19 +88,19 @@ SUBSCRIBE_URL = "https://t.me/send?start=IVKdpMOgoHxI"
 MODELS = {
     "nine_code": {
         "name": "Nine Code",
-        "real": "gemini-3.8-flash",
+        "real": "gemini-3.8-flash",          # Обновлено
         "free_limit": 5,
         "paid_limit": 50,
     },
     "nine_pro": {
         "name": "Nine Pro",
-        "real": "gemini-3.1-flash-lite",
+        "real": "gemini-3.5-flash",
         "free_limit": 20,
         "paid_limit": 90,
     },
     "nine_flash": {
         "name": "Nine Flash",
-        "real": "gemini-2.5-flash-lite",
+        "real": "gemini-3.1-flash-lite",     # Обновлено
         "free_limit": None,
         "paid_limit": None,
     },
@@ -109,7 +109,20 @@ MODELS = {
 DEFAULT_MODEL = "nine_flash"
 MODEL_ORDER = ["nine_code", "nine_pro", "nine_flash"]
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# === ИЗМЕНЕНИЕ: Создание клиента для работы с ключами нового формата (AQ...) ===
+try:
+    client = genai.Client(vertexai=True, api_key=GEMINI_API_KEY)
+    logging.info("Клиент GenAI инициализирован в режиме Vertex AI Express.")
+except Exception as e:
+    logging.error(f"Ошибка инициализации клиента Vertex AI: {e}")
+    # Попытка fallback на стандартный режим (если ключ внезапно окажется старым AIza)
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        logging.info("Клиент GenAI инициализирован в стандартном режиме (AI Studio).")
+    except Exception as e2:
+        logging.critical(f"Не удалось инициализировать клиент GenAI: {e2}")
+        raise
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -417,20 +430,36 @@ async def call_gemini(contents: list, chat_id: int, model_key: str, max_retries:
         except Exception as e:
             err = str(e)
             last_err = err
-            transient = ("429" in err) or ("503" in err) or ("UNAVAILABLE" in err)
+
+            # === ИЗМЕНЕНИЕ: Различаем типы ошибок ===
+            # 403 — проблема с ключом
+            if "403" in err or "PERMISSION_DENIED" in err:
+                logging.error(f"Ошибка доступа (403) для модели {display_name}: {err[:200]}")
+                return f"Сервис временно недоступен (проблема с доступом к API). Сообщи администратору."
+
+            # 404 — модель не найдена
+            if "404" in err or "NOT_FOUND" in err:
+                logging.error(f"Модель {real_model} не найдена: {err[:200]}")
+                return f"Модель {display_name} сейчас недоступна. Сообщи администратору."
+
+            # 429 — лимит запросов
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                return f"Закончился лимит на использование модели {display_name}. Попробуй позже."
+
+            # 503 — временная ошибка, пробуем еще раз
+            transient = ("503" in err) or ("UNAVAILABLE" in err)
             if transient and attempt < max_retries - 1:
                 wait = (2 ** attempt) + 1
-                logging.warning(f"Временная ошибка API, повтор через {wait}с: {err[:120]}")
+                logging.warning(f"Временная ошибка API (503), повтор через {wait}с: {err[:120]}")
                 await asyncio.sleep(wait)
                 continue
-            logging.exception("Gemini error")
-            break
 
-    if "429" in last_err:
-        return f"Закончился лимит на использование модели {display_name}. Попробуй позже."
-    if "503" in last_err or "UNAVAILABLE" in last_err:
-        return f"Модель {display_name} сейчас недоступна. Попробуй через несколько секунд."
-    return f"Закончился лимит на использование модели {display_name}."
+            # Все остальные ошибки
+            logging.exception(f"Неизвестная ошибка Gemini для модели {display_name}")
+            return f"Произошла ошибка при обращении к модели {display_name}. Попробуй позже."
+
+    # Если все попытки исчерпаны
+    return f"Модель {display_name} временно недоступна. Попробуй через несколько секунд."
 
 
 def build_contents(state: UserState, user_text: str) -> list:
