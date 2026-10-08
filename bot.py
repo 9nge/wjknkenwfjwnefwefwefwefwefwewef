@@ -109,19 +109,8 @@ MODELS = {
 DEFAULT_MODEL = "nine_flash"
 MODEL_ORDER = ["nine_code", "nine_pro", "nine_flash"]
 
-# === ИЗМЕНЕНИЕ: Создание клиента для работы с ключами нового формата (AQ...) ===
-try:
-    client = genai.Client(vertexai=True, api_key=GEMINI_API_KEY)
-    logging.info("Клиент GenAI инициализирован в режиме Vertex AI Express.")
-except Exception as e:
-    logging.error(f"Ошибка инициализации клиента Vertex AI: {e}")
-    # Попытка fallback на стандартный режим (если ключ внезапно окажется старым AIza)
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        logging.info("Клиент GenAI инициализирован в стандартном режиме (AI Studio).")
-    except Exception as e2:
-        logging.critical(f"Не удалось инициализировать клиент GenAI: {e2}")
-        raise
+client = genai.Client(api_key=GEMINI_API_KEY)
+logging.info("Клиент GenAI инициализирован в режиме Gemini Developer API (AI Studio).")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
