@@ -6,7 +6,7 @@ import html
 import re
 
 from dotenv import load_dotenv
-from aiogram import Dispatcher, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -20,6 +20,7 @@ from google.genai import types
 
 load_dotenv()
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
