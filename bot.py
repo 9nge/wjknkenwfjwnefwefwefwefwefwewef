@@ -104,7 +104,7 @@ def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
-                text="🎓 Обучить модель на майнкрафт читах",
+                text="Обучить модель на майнкрафт читах",
                 callback_data="train",
             )],
             [InlineKeyboardButton(text="Пожертвовать", url=cryptobot_link)],
@@ -240,7 +240,7 @@ async def call_gemini(contents: list, chat_id: int, max_retries: int = 3) -> str
         system = (
             SYSTEM_PROMPT
             + "\n\n=== БАЗА ЗНАНИЙ: модули читов и обходы ===\n"
-            + "Используй эти материалы как основу для ответов про обходы античитов.\n"
+            + "Используй эти материалы как основу для ответов про обходы античитов и написания чит функций.\n"
             + training_cache
         )
 
@@ -290,7 +290,7 @@ def build_contents(chat_id: int, user_text: str) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "Привет! Просто напиши мне сообщение или отправь текстовый файл.\n\n"
-        "Можешь обучить меня на своих модулях читов — жми кнопку ниже.",
+        "Ты можешь 'обучить' меня на исходниках других читов — просто жми кнопку и я подругужу все свои знания и напишу тебе самый лучший чит :).",
         reply_markup=start_keyboard(),
     )
 
@@ -328,8 +328,8 @@ async def on_train(callback: CallbackQuery):
     data = await asyncio.to_thread(load_training_data)
     if not data:
         await callback.message.answer(
-            "Папка Minecraft_Cheat_Modules пуста или не найдена.\n"
-            "Создай её в корне проекта и положи туда файлы."
+            "Упс, я не нашел базу с модулями.\n"
+            "Возможно мой разработчик обновляет список с новыми модулями, подождешь немного? :)"
         )
         return
 
@@ -339,7 +339,7 @@ async def on_train(callback: CallbackQuery):
     await callback.message.answer(
         f"Готово. Загружено файлов: {file_count}.\n"
         f"Объём базы: {len(data)} символов.\n\n"
-        "Теперь можешь спрашивать про обходы — я буду опираться на твои модули."
+        "Теперь можем приступить к работе — я буду опираться на чужие читы."
     )
 
 
