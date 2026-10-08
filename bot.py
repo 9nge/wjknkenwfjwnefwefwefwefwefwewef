@@ -5,7 +5,6 @@ import io
 import html
 import re
 
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -18,11 +17,29 @@ from aiogram.types import (
 from google import genai
 from google.genai import types
 
-load_dotenv()
+# .env — только для локального запуска. Если файла нет (например на хостинге),
+# просто игнорируем. Переменные будут браться из окружения процесса.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+# Явная проверка на старте, чтобы не падать непонятной ошибкой.
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не задан. Добавь его в Environment variables хостинга "
+        "(или в .env при локальном запуске)."
+    )
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY не задан. Добавь его в Environment variables хостинга "
+        "(или в .env при локальном запуске)."
+    )
 
 SYSTEM_PROMPT = """Ты — NineAI, Telegram-бот. Отвечай ТОЛЬКО на русском языке, кратко, по делу, без воды.
 
@@ -113,7 +130,7 @@ def start_keyboard() -> InlineKeyboardMarkup:
 
 
 def load_training_data() -> str:
-    """Читает все поддерживаемые файлы с сайта yougame.biz и кэширует."""
+    """Читает все поддерживаемые файлы из папки модулей и кэширует."""
     global training_cache
     if training_cache is not None:
         return training_cache
@@ -290,7 +307,7 @@ def build_contents(chat_id: int, user_text: str) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "Привет! Просто напиши мне сообщение или отправь текстовый файл.\n\n"
-        "Ты можешь 'обучить' меня на исходниках других читов — просто жми кнопку и я подругужу все свои знания и напишу тебе самый лучший чит :).",
+        "Ты можешь 'обучить' меня на исходниках других читов — просто жми кнопку и я подружу все свои знания и напишу тебе самый лучший чит :).",
         reply_markup=start_keyboard(),
     )
 
