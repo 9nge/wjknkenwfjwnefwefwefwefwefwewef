@@ -325,7 +325,7 @@ async def on_train(callback: CallbackQuery):
 
     await callback.answer("Загружаю модули...")
 
-    data = load_training_data()
+    data = await asyncio.to_thread(load_training_data)
     if not data:
         await callback.message.answer(
             "Папка Minecraft_Cheat_Modules пуста или не найдена.\n"
