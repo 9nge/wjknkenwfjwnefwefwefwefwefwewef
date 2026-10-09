@@ -410,23 +410,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <title>{title}</title>
 <style>
   :root {{
-    --bg: #0a0d13;
-    --panel: rgba(20, 24, 33, 0.86);
-    --border: #262d3a;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #8b5cf6;
-    --accent2: #06b6d4;
-    --code-bg: #0b0f15;
-    --code-border: #1f2635;
+    --bg: #c9c6bd;
+    --panel: #e6e3da;
+    --border: #a5a29a;
+    --text: #2b3529;
+    --muted: #616a5c;
+    --accent: #141414;
+    --accent2: #3d4a3a;
+    --code-bg: #141414;
+    --code-border: #000000;
+    --code-text: #c4d1ba;
   }}
   * {{ box-sizing: border-box; }}
   html, body {{ margin: 0; padding: 0; }}
   body {{
     padding: 40px 16px 60px;
     background:
-      radial-gradient(1200px 600px at 8% -10%, #2a1a5e 0%, transparent 60%),
-      radial-gradient(1000px 500px at 110% 5%, #063a4a 0%, transparent 55%),
+      radial-gradient(1100px 550px at 10% -10%, #dedbd2 0%, transparent 60%),
+      radial-gradient(900px 500px at 110% 5%, #b3b0a7 0%, transparent 55%),
       var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -440,13 +441,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     border: 1px solid var(--border);
     border-radius: 20px;
     padding: 34px 36px;
-    box-shadow: 0 24px 60px rgba(0,0,0,0.55);
-    backdrop-filter: blur(10px);
+    box-shadow: 0 22px 55px rgba(20, 20, 20, 0.35);
   }}
   h1.title {{
     font-size: 24px;
     margin: 0 0 6px;
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    background: linear-gradient(90deg, #0d0d0d, #3d4a3a);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
@@ -462,37 +462,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     display: flex;
     gap: 14px;
     flex-wrap: wrap;
+    align-items: center;
   }}
   .meta .badge {{
     display: inline-block;
     padding: 2px 10px;
     border-radius: 999px;
-    background: rgba(139, 92, 246, 0.15);
-    color: #c4b5fd;
+    background: #141414;
+    color: #c4d1ba;
     font-size: 12px;
-    border: 1px solid rgba(139, 92, 246, 0.35);
+    border: 1px solid #000000;
+    letter-spacing: 0.3px;
   }}
   .text {{
     white-space: pre-wrap;
     word-wrap: break-word;
     font-size: 15.5px;
     margin: 12px 0;
+    color: var(--text);
   }}
   .code-head {{
     display: flex;
     align-items: center;
     gap: 8px;
-    background: #0f141c;
+    background: #0f0f0f;
     border: 1px solid var(--code-border);
     border-bottom: none;
     border-radius: 12px 12px 0 0;
     padding: 9px 14px;
     font-size: 12px;
-    color: var(--muted);
+    color: #8f9b88;
     margin-top: 18px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }}
-  .code-head .fname {{ margin-left: 8px; }}
+  .code-head .fname {{ margin-left: 8px; color: #8f9b88; }}
   pre.code {{
     background: var(--code-bg);
     border: 1px solid var(--code-border);
@@ -503,14 +506,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     font-size: 13.5px;
     line-height: 1.65;
     margin: 0 0 12px;
-    color: #d1fae5;
+    color: var(--code-text);
     tab-size: 4;
   }}
-  pre.code code {{ font-family: inherit; }}
+  pre.code code {{ font-family: inherit; color: inherit; }}
   .dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; }}
-  .d1 {{ background: #ff5f56; }}
-  .d2 {{ background: #ffbd2e; }}
-  .d3 {{ background: #27c93f; }}
+  .d1 {{ background: #2a2a2a; }}
+  .d2 {{ background: #3d4a3a; }}
+  .d3 {{ background: #5a6b52; }}
   .footer {{
     text-align: center;
     margin-top: 26px;
@@ -519,7 +522,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     letter-spacing: 0.4px;
   }}
   .footer b {{
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    background: linear-gradient(90deg, #0d0d0d, #3d4a3a);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
@@ -594,7 +597,7 @@ async def send_as_html_file(message: Message, raw_text: str, model_name: str) ->
             document=payload,
             caption=(
                 f"Ответ от {model_name} слишком большой для чата — "
-                f"открывай как HTML-страницу (браузер покажет красиво)."
+                f"открывай как HTML-страницу."
             ),
         )
     except Exception:
