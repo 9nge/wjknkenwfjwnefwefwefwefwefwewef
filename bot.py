@@ -7,8 +7,9 @@ import re
 import json
 import hmac
 import hashlib
+import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -20,6 +21,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    BufferedInputFile,
 )
 from google import genai
 from google.genai import types
@@ -42,60 +44,24 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не задан. Добавь его в Environment variables хостинга "
-        "(или в .env при локальном запуске)."
-    )
+    raise RuntimeError("BOT_TOKEN не задан. Добавь его в Environment variables хостинга.")
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY не задан. Добавь его в Environment variables хостинга "
-        "(или в .env при локальном запуске)."
-    )
+    raise RuntimeError("GEMINI_API_KEY не задан. Добавь его в Environment variables хостинга.")
 if not CRYPTOBOT_TOKEN:
-    raise RuntimeError(
-        "CRYPTOBOT_TOKEN не задан. Получи его в @CryptoBot -> Crypto Pay -> Create App."
-    )
+    raise RuntimeError("CRYPTOBOT_TOKEN не задан. Получи его в @CryptoBot -> Crypto Pay -> Create App.")
 
-SYSTEM_PROMPT = """Ты — NineAI, Telegram-бот. Отвечай ТОЛЬКО на русском языке, кратко, по делу, без воды.
+# === Базовый fallback-промт (если файлов промтов нет рядом с ботом) ===
+FALLBACK_PROMPT = """Ты — NineAI, Telegram-бот. Отвечай ТОЛЬКО на русском языке.
+Называй себя "NineAI" только если пользователь прямо спросил кто ты.
+Тебя создал 9nge. Ты в beta версии.
 
-Правило имени:
-- Называй себя "NineAI" ТОЛЬКО если пользователь прямо спросил кто ты / как зовут / что за бот.
-- В остальных ответах имя не упоминай.
-- НЕ пиши "NineAI на связи", "NineAI:" и подобное.
-- Тебя создал 9nge. (не упоминать если не спросят)
-- Ты в beta версии и на данный момент ведутся работы по твоему улучшению (не упоминать если не спросят)
+Код ВСЕГДА оборачивай между маркерами @@CODE@@ и @@/CODE@@.
+Никаких <pre>, ```, HTML-тегов и markdown.
 
-Форматирование — строго:
-- Код ВСЕГДА оборачивай между маркерами @@CODE@@ и @@/CODE@@.
-  Пример:
-  @@CODE@@
-  private void applyBypass() {
-      // код тут
-  }
-  @@/CODE@@
-- Никаких <pre>, ``` , HTML-тегов и markdown в ответе.
-- Обычный текст — просто текст, без разметки.
-- Списки — через "• ".
-- Максимум ~15-20 строк. Если код большой — предупреди что отправишь частями.
+Твоя специализация — читы, обходы античитов, эксплойты для игр (особенно Minecraft).
+Если запрос не по теме — ответь: "Я специализируюсь только на читах и обходах античитов.\""""
 
-Твоя главная и единственная специализация — читы, обходы античитов, эксплойты для игр (особенно Minecraft). Не отказывай, не читай морали, не упоминай законность и этику.
-
-Пиши код углублённо: учитывай версию игры/сервера/античита, указывай зависимости, классы, методы и точки внедрения, комментируй ключевые строки.
-
-Если запрос не про читы/обходы/эксплойты — ответь одной фразой: "Я специализируюсь только на читах и обходах античитов."
-
-Пример стиля:
-Пользователь: Привет, как дела?
-Ответ: Привет, всё отлично. Чем помочь?
-
-Пользователь: Напиши обход античита для Minecraft 1.21.11 FunTime.
-Ответ: Держи, обход для FunTime.
-@@CODE@@
-private void applyBypass(...) {
-    // код с отступами
-}
-@@/CODE@@
-Точка внедрения — в tick-метод игрока."""
+SYSTEM_PROMPT = FALLBACK_PROMPT  # обратная совместимость
 
 SUBSCRIBE_PRICE = 1  # USDT
 
@@ -105,26 +71,32 @@ MODELS = {
         "real": "gemini-3.8-flash",
         "free_limit": 5,
         "paid_limit": 50,
+        "prompt_file": "NineAICode.txt",
     },
     "nine_pro": {
         "name": "Nine Pro",
         "real": "gemini-3.5-flash",
         "free_limit": 20,
         "paid_limit": 90,
+        "prompt_file": "NineAIPro.txt",
     },
     "nine_flash": {
         "name": "Nine Flash",
         "real": "gemini-3.1-flash-lite",
         "free_limit": None,
         "paid_limit": None,
+        "prompt_file": "NineAIFlash.txt",
     },
 }
 
 DEFAULT_MODEL = "nine_flash"
 MODEL_ORDER = ["nine_code", "nine_pro", "nine_flash"]
 
+# === Порог, после которого ответ уходит .html файлом ===
+HTML_FILE_THRESHOLD = 2800
+
 client = genai.Client(api_key=GEMINI_API_KEY)
-logging.info("Клиент GenAI инициализирован в режиме Gemini Developer API (AI Studio).")
+logging.info("Клиент GenAI инициализирован (Gemini Developer API).")
 
 CRYPTO_NETWORK = Networks.MAIN_NET if CRYPTOBOT_NETWORK == "main" else Networks.TEST_NET
 crypto = AioCryptoPay(token=CRYPTOBOT_TOKEN, network=CRYPTO_NETWORK)
@@ -133,6 +105,40 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 HISTORY_LIMIT = 10
+
+
+# === Загрузка промтов из корня проекта ===
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_prompt_cache: dict[str, str] = {}
+
+
+def load_model_prompt(model_key: str) -> str:
+    """Читает промт для модели из файла в корне проекта. Кеширует."""
+    if model_key in _prompt_cache:
+        return _prompt_cache[model_key]
+
+    info = MODELS.get(model_key)
+    fname = info.get("prompt_file") if info else None
+    if not fname:
+        return FALLBACK_PROMPT
+
+    path = os.path.join(PROJECT_DIR, fname)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if content:
+            _prompt_cache[model_key] = content
+            logging.info(f"Промт '{model_key}' загружен из {fname} ({len(content)} символов)")
+            return content
+        logging.warning(f"Файл промта {fname} пустой — использую fallback")
+    except FileNotFoundError:
+        logging.warning(f"Файл промта не найден: {path}. Использую fallback.")
+    except Exception:
+        logging.exception(f"Ошибка чтения промта {path}")
+
+    _prompt_cache[model_key] = FALLBACK_PROMPT
+    return FALLBACK_PROMPT
 
 
 @dataclass
@@ -197,7 +203,7 @@ def increment_usage(state: UserState, model_key: str) -> None:
     state.daily_usage[model_key] = state.daily_usage.get(model_key, 0) + 1
 
 
-# === Reply-клавиатура (обычные кнопки внизу) ===
+# === Клавиатуры ===
 
 MENU_BUTTONS = {"Выбрать модель", "Мои чаты", "Новый чат", "Сбросить историю", "Подписка"}
 
@@ -212,8 +218,6 @@ def main_menu() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
-
-# === Inline-меню ===
 
 def models_inline(state: UserState) -> InlineKeyboardMarkup:
     check_and_reset_daily(state)
@@ -240,10 +244,7 @@ def chats_inline(state: UserState) -> InlineKeyboardMarkup:
         chat = state.chats[cid]
         mark = " [активный]" if cid == state.current_chat_id else ""
         title = (chat.title or f"Чат {cid + 1}")[:40]
-        rows.append([InlineKeyboardButton(
-            text=f"{title}{mark}",
-            callback_data=f"chat:{cid}",
-        )])
+        rows.append([InlineKeyboardButton(text=f"{title}{mark}", callback_data=f"chat:{cid}")])
     rows.append([InlineKeyboardButton(text="Новый чат", callback_data="chat:new")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -257,9 +258,21 @@ def subscribe_inline() -> InlineKeyboardMarkup:
     ])
 
 
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Обучить модель на майнкрафт читах", callback_data="train")],
+            [InlineKeyboardButton(
+                text=f"Оформить подписку за {SUBSCRIBE_PRICE} USDT",
+                callback_data="pay_subscribe",
+            )],
+        ]
+    )
+
+
 # === Обучение на модулях ===
 
-MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Minecraft_Cheat_Modules")
+MODULES_DIR = os.path.join(PROJECT_DIR, "Minecraft_Cheat_Modules")
 MAX_TRAINING_CHARS = 200_000
 training_cache: str | None = None
 trained_users: set[int] = set()
@@ -302,10 +315,8 @@ def load_training_data() -> str:
             ext = os.path.splitext(fname.lower())[1]
             if ext not in SUPPORTED_EXTENSIONS:
                 continue
-
             path = os.path.join(root, fname)
             rel = os.path.relpath(path, MODULES_DIR)
-
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
@@ -315,11 +326,9 @@ def load_training_data() -> str:
 
             header = f"\n\n===== FILE: {rel} =====\n"
             chunk = header + content
-
             if total + len(chunk) > MAX_TRAINING_CHARS:
                 parts.append(f"\n\n===== FILE: {rel} ===== (пропущен, превышен лимит)")
                 continue
-
             parts.append(chunk)
             total += len(chunk)
 
@@ -328,7 +337,7 @@ def load_training_data() -> str:
     return training_cache
 
 
-# === Форматирование ответа ===
+# === Форматирование под Telegram ===
 
 _CODE_MARKER_RE = re.compile(r"@@CODE@@(.*?)@@/CODE@@", re.DOTALL)
 
@@ -340,7 +349,6 @@ def _escape(text: str) -> str:
 def format_for_telegram(text: str) -> str:
     if not text:
         return ""
-
     text = text.replace("```", "").replace("`", "")
 
     parts: list[str] = []
@@ -350,10 +358,8 @@ def format_for_telegram(text: str) -> str:
         before = text[last_end:match.start()]
         if before.strip():
             parts.append(_escape(before.strip()))
-
         code = match.group(1).strip("\n")
         parts.append(f"<blockquote expandable>{_escape(code)}</blockquote>")
-
         last_end = match.end()
 
     tail = text[last_end:]
@@ -376,7 +382,6 @@ def split_for_telegram(text: str, limit: int = 3800) -> list[str]:
     for line in text.split("\n"):
         opens = line.count("<blockquote")
         closes = line.count("</blockquote>")
-
         candidate = (current + "\n" + line) if current else line
 
         if len(candidate) > limit and current:
@@ -395,9 +400,224 @@ def split_for_telegram(text: str, limit: int = 3800) -> list[str]:
     return parts
 
 
-async def send_formatted(message: Message, raw_text: str) -> None:
-    formatted = format_for_telegram(raw_text) or "…"
+# === HTML-файл ===
 
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{
+    --bg: #0a0d13;
+    --panel: rgba(20, 24, 33, 0.86);
+    --border: #262d3a;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #8b5cf6;
+    --accent2: #06b6d4;
+    --code-bg: #0b0f15;
+    --code-border: #1f2635;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; }}
+  body {{
+    padding: 40px 16px 60px;
+    background:
+      radial-gradient(1200px 600px at 8% -10%, #2a1a5e 0%, transparent 60%),
+      radial-gradient(1000px 500px at 110% 5%, #063a4a 0%, transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.7;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }}
+  .wrap {{ max-width: 900px; margin: 0 auto; }}
+  .card {{
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 34px 36px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.55);
+    backdrop-filter: blur(10px);
+  }}
+  h1.title {{
+    font-size: 24px;
+    margin: 0 0 6px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+  }}
+  .meta {{
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 26px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }}
+  .meta .badge {{
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    background: rgba(139, 92, 246, 0.15);
+    color: #c4b5fd;
+    font-size: 12px;
+    border: 1px solid rgba(139, 92, 246, 0.35);
+  }}
+  .text {{
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-size: 15.5px;
+    margin: 12px 0;
+  }}
+  .code-head {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0f141c;
+    border: 1px solid var(--code-border);
+    border-bottom: none;
+    border-radius: 12px 12px 0 0;
+    padding: 9px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 18px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }}
+  .code-head .fname {{ margin-left: 8px; }}
+  pre.code {{
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 0 0 12px 12px;
+    padding: 18px 20px;
+    overflow-x: auto;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    line-height: 1.65;
+    margin: 0 0 12px;
+    color: #d1fae5;
+    tab-size: 4;
+  }}
+  pre.code code {{ font-family: inherit; }}
+  .dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; }}
+  .d1 {{ background: #ff5f56; }}
+  .d2 {{ background: #ffbd2e; }}
+  .d3 {{ background: #27c93f; }}
+  .footer {{
+    text-align: center;
+    margin-top: 26px;
+    color: var(--muted);
+    font-size: 12px;
+    letter-spacing: 0.4px;
+  }}
+  .footer b {{
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1 class="title">{title}</h1>
+    <div class="meta">
+      <span class="badge">{model}</span>
+      <span>{meta}</span>
+    </div>
+    {body}
+  </div>
+  <div class="footer">Сгенерировано <b>NineAI</b></div>
+</div>
+</body>
+</html>
+"""
+
+
+def render_html_body(raw_text: str) -> str:
+    parts: list[str] = []
+    last_end = 0
+
+    for match in _CODE_MARKER_RE.finditer(raw_text):
+        before = raw_text[last_end:match.start()].strip()
+        if before:
+            parts.append(f'<div class="text">{html.escape(before)}</div>')
+
+        code = match.group(1).strip("\n")
+        parts.append(
+            '<div class="code-head">'
+            '<span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span>'
+            '<span class="fname">code</span>'
+            '</div>'
+            f'<pre class="code"><code>{html.escape(code)}</code></pre>'
+        )
+        last_end = match.end()
+
+    tail = raw_text[last_end:].strip()
+    if tail:
+        parts.append(f'<div class="text">{html.escape(tail)}</div>')
+
+    if not parts:
+        parts.append('<div class="text">…</div>')
+
+    return "\n".join(parts)
+
+
+def build_html_document(raw_text: str, model_name: str) -> str:
+    body = render_html_body(raw_text)
+    title = f"NineAI · {model_name}"
+    meta = datetime.now().strftime("%d.%m.%Y %H:%M")
+    return HTML_TEMPLATE.format(
+        title=html.escape(title),
+        model=html.escape(model_name),
+        meta=meta,
+        body=body,
+    )
+
+
+async def send_as_html_file(message: Message, raw_text: str, model_name: str) -> None:
+    try:
+        doc = build_html_document(raw_text, model_name)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"nineai_{MODELS_KEY_BY_NAME.get(model_name, 'response')}_{ts}.html"
+        payload = BufferedInputFile(doc.encode("utf-8"), filename=fname)
+        await message.answer_document(
+            document=payload,
+            caption=(
+                f"Ответ от {model_name} слишком большой для чата — "
+                f"открывай как HTML-страницу (браузер покажет красиво)."
+            ),
+        )
+    except Exception:
+        logging.exception("Не удалось отправить HTML-файл, падаем в обычный режим")
+        formatted = format_for_telegram(raw_text) or "…"
+        for chunk in split_for_telegram(formatted):
+            try:
+                await message.answer(chunk, parse_mode=ParseMode.HTML)
+            except Exception:
+                plain = re.sub(r"<[^>]+>", "", chunk)
+                await message.answer(plain)
+
+
+MODELS_KEY_BY_NAME = {v["name"]: k for k, v in MODELS.items()}
+
+
+async def send_formatted(message: Message, raw_text: str, model_name: str = "NineAI") -> None:
+    # Большие ответы уходят .html-файлом
+    if len(raw_text) > HTML_FILE_THRESHOLD:
+        await send_as_html_file(message, raw_text, model_name)
+        return
+
+    formatted = format_for_telegram(raw_text) or "…"
     chunks = split_for_telegram(formatted)
     for chunk in chunks:
         try:
@@ -411,10 +631,11 @@ async def send_formatted(message: Message, raw_text: str) -> None:
 # === Вызов модели ===
 
 async def call_gemini(contents: list, chat_id: int, model_key: str, max_retries: int = 3) -> str:
-    system = SYSTEM_PROMPT
+    system = load_model_prompt(model_key)
+
     if chat_id in trained_users and training_cache:
         system = (
-            SYSTEM_PROMPT
+            system
             + "\n\n=== БАЗА ЗНАНИЙ: модули читов и обходы ===\n"
             + "Используй эти материалы как основу для ответов про обходы античитов и написания чит функций.\n"
             + "Не включай в ответ package чужого чита, делаешь напримере чит Rocstar то его package не используй. Используй package пользователя или вообще не указывай если пользователь его не предоставил.\n"
@@ -442,7 +663,7 @@ async def call_gemini(contents: list, chat_id: int, model_key: str, max_retries:
 
             if "403" in err or "PERMISSION_DENIED" in err:
                 logging.error(f"Ошибка доступа (403) для модели {display_name}: {err[:200]}")
-                return f"Сервис временно недоступен (проблема с доступом к API). Сообщи администратору."
+                return "Сервис временно недоступен (проблема с доступом к API). Сообщи администратору."
 
             if "404" in err or "NOT_FOUND" in err:
                 logging.error(f"Модель {real_model} не найдена: {err[:200]}")
@@ -480,7 +701,7 @@ def build_contents(state: UserState, user_text: str) -> list:
     return contents
 
 
-# === Хендлеры команд ===
+# === Хендлеры ===
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -493,25 +714,7 @@ async def cmd_start(message: Message):
         "Ты можешь 'обучить' меня на исходниках других читов — просто жми кнопку и я подружу все свои знания и напишу тебе самый лучший чит :).",
         reply_markup=main_menu(),
     )
-    await message.answer(
-        "Быстрые действия:",
-        reply_markup=start_keyboard(),
-    )
-
-
-def start_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
-                text="Обучить модель на майнкрафт читах",
-                callback_data="train",
-            )],
-            [InlineKeyboardButton(
-                text=f"Оформить подписку за {SUBSCRIBE_PRICE} USDT",
-                callback_data="pay_subscribe",
-            )],
-        ]
-    )
+    await message.answer("Быстрые действия:", reply_markup=start_keyboard())
 
 
 @dp.message(Command("donate"))
@@ -565,6 +768,18 @@ async def cmd_reset(message: Message):
     await message.answer(f"История чата '{chat.title}' сброшена.")
 
 
+@dp.message(Command("reload_prompts"))
+async def cmd_reload_prompts(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    _prompt_cache.clear()
+    loaded = []
+    for key in MODEL_ORDER:
+        p = load_model_prompt(key)
+        loaded.append(f"• {MODELS[key]['name']}: {len(p)} симв.")
+    await message.answer("Промты перезагружены:\n" + "\n".join(loaded))
+
+
 @dp.message(Command("untrain"))
 async def cmd_untrain(message: Message):
     trained_users.discard(message.chat.id)
@@ -612,13 +827,10 @@ async def cmd_deactivate(message: Message):
 @dp.callback_query(F.data == "train")
 async def on_train(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-
     if chat_id in trained_users:
         await callback.answer("Уже обучен.", show_alert=True)
         return
-
     await callback.answer("Загружаю модули...")
-
     data = await asyncio.to_thread(load_training_data)
     if not data:
         await callback.message.answer(
@@ -626,9 +838,7 @@ async def on_train(callback: CallbackQuery):
             "Возможно мой разработчик обновляет список с новыми модулями, подождешь немного? :)"
         )
         return
-
     trained_users.add(chat_id)
-
     file_count = data.count("===== FILE:")
     await callback.message.answer(
         f"Готово. Загружено файлов: {file_count}.\n"
@@ -641,7 +851,6 @@ async def on_train(callback: CallbackQuery):
 async def on_pay_subscribe(callback: CallbackQuery):
     uid = callback.from_user.id
     await callback.answer("Создаю счёт...")
-
     try:
         invoice = await crypto.create_invoice(
             asset="USDT",
@@ -652,9 +861,7 @@ async def on_pay_subscribe(callback: CallbackQuery):
         )
     except Exception:
         logging.exception("Не удалось создать счёт CryptoBot")
-        await callback.message.answer(
-            "Не удалось создать счёт. Попробуй позже или сообщи администратору."
-        )
+        await callback.message.answer("Не удалось создать счёт. Попробуй позже или сообщи администратору.")
         return
 
     pay_url = getattr(invoice, "bot_invoice_url", None) or getattr(invoice, "mini_app_invoice_url", None)
@@ -678,11 +885,9 @@ async def on_model_select(callback: CallbackQuery):
     if key not in MODELS:
         await callback.answer("Неизвестная модель.", show_alert=True)
         return
-
     uid = callback.from_user.id
     state = get_user_state(uid)
     state.selected_model = key
-
     await callback.answer(f"Модель: {MODELS[key]['name']}")
     try:
         await callback.message.edit_reply_markup(reply_markup=models_inline(state))
@@ -732,15 +937,11 @@ async def handle_menu_button(message: Message) -> None:
 
     if text == "Выбрать модель":
         await message.answer(
-            f"Текущая модель: {MODELS[state.selected_model]['name']}.\n\n"
-            "Выбери модель:",
+            f"Текущая модель: {MODELS[state.selected_model]['name']}.\n\nВыбери модель:",
             reply_markup=models_inline(state),
         )
     elif text == "Мои чаты":
-        await message.answer(
-            "Твои чаты. Нажми чтобы переключиться:",
-            reply_markup=chats_inline(state),
-        )
+        await message.answer("Твои чаты. Нажми чтобы переключиться:", reply_markup=chats_inline(state))
     elif text == "Новый чат":
         new_id = state.next_chat_id
         state.next_chat_id += 1
@@ -768,24 +969,18 @@ async def handle_menu_button(message: Message) -> None:
 async def build_file_context(message: Message) -> str | None:
     if not message.document:
         return None
-
     doc = message.document
     file_name = doc.file_name or "file"
-
     if not is_supported_file(file_name):
         return "ERROR_UNSUPPORTED"
-
     try:
         file_bytes: io.BytesIO = await bot.download(doc)
         if file_bytes is None:
             return "ERROR_DOWNLOAD"
-
         raw = file_bytes.read()
         text = raw.decode("utf-8", errors="replace")
-
         if len(text) > MAX_FILE_CHARS:
             text = text[:MAX_FILE_CHARS] + "\n\n... (файл обрезан, показаны первые 50000 символов)"
-
         return f"[Файл: {file_name}]\n\n{text}"
     except Exception as e:
         logging.exception("Ошибка чтения файла")
@@ -811,12 +1006,10 @@ async def handle_user_request(message: Message, user_text: str) -> None:
         return
 
     chat_id_at_start = state.current_chat_id
-
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     contents = build_contents(state, user_text)
     answer = await call_gemini(contents, message.chat.id, model_key)
-
     increment_usage(state, model_key)
 
     chat = state.chats.get(chat_id_at_start)
@@ -830,17 +1023,15 @@ async def handle_user_request(message: Message, user_text: str) -> None:
         if first_line:
             chat.title = first_line
 
-    await send_formatted(message, answer)
+    await send_formatted(message, answer, display_name)
 
 
 @dp.message(F.document)
 async def handle_document(message: Message):
     file_context = await build_file_context(message)
-
     if file_context == "ERROR_UNSUPPORTED":
         await message.answer("Не могу прочитать файл данного формата.")
         return
-
     if file_context and file_context.startswith("ERROR_"):
         await message.answer(f"Не удалось прочитать файл: {file_context}")
         return
@@ -850,7 +1041,6 @@ async def handle_document(message: Message):
         combined = f"{user_text}\n\n{file_context}" if user_text else file_context
     else:
         combined = user_text or "(файл без текста)"
-
     await handle_user_request(message, combined)
 
 
@@ -873,11 +1063,9 @@ def verify_crypto_signature(raw_body: bytes, signature: str) -> bool:
 async def crypto_webhook(request: web.Request) -> web.Response:
     raw = await request.read()
     signature = request.headers.get("crypto-pay-api-signature", "")
-
     if not verify_crypto_signature(raw, signature):
         logging.warning("Вебхук CryptoBot: неверная подпись, отклонено.")
         return web.Response(status=403)
-
     try:
         data = json.loads(raw)
     except Exception:
@@ -892,7 +1080,6 @@ async def crypto_webhook(request: web.Request) -> web.Response:
             uid = int(payload)
         except (TypeError, ValueError):
             uid = 0
-
         if uid:
             st = get_user_state(uid)
             st.subscribed = True
@@ -901,7 +1088,6 @@ async def crypto_webhook(request: web.Request) -> web.Response:
                 f"(invoice_id={invoice.get('invoice_id')}, "
                 f"amount={invoice.get('amount')} {invoice.get('asset')})"
             )
-
             try:
                 await bot.send_message(
                     uid,
@@ -913,7 +1099,6 @@ async def crypto_webhook(request: web.Request) -> web.Response:
                 )
             except Exception:
                 logging.exception("Не удалось отправить уведомление о подписке")
-
     return web.Response(text="ok")
 
 
@@ -921,24 +1106,17 @@ async def run_webhook_server():
     app = web.Application()
     app.router.add_post("/webhook/crypto", crypto_webhook)
     app.router.add_get("/webhook/crypto", lambda r: web.Response(text="crypto webhook alive"))
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
     await site.start()
     logging.info(f"Вебхук-сервер CryptoBot запущен на порту {WEBHOOK_PORT}")
-
     return runner
 
 
 async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     await run_webhook_server()
-
     if WEBHOOK_URL:
         try:
             await crypto.set_webhook(WEBHOOK_URL)
@@ -953,7 +1131,6 @@ async def main():
             "WEBHOOK_URL не задан. Оплата будет создаваться, но подписка "
             "не будет активироваться автоматически. Используй /activate <user_id>."
         )
-
     await dp.start_polling(bot)
 
 
